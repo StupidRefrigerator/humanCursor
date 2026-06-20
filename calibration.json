@@ -1,0 +1,23 @@
+{
+  "h_min": 20,
+  "h_max": 49,
+  "s_min": 125,
+  "s_max": 248,
+  "v_min": 72,
+  "v_max": 255,
+  "hsv_lower": [
+    20,
+    125,
+    72
+  ],
+  "hsv_upper": [
+    49,
+    248,
+    255
+  ],
+  "camera_index": 0,
+  "min_contour_area": 500,
+  "saved_at": "2026-06-20T12:53:50",
+  "area_near": 13863.609464845922,
+  "area_far": 4611.403803460169
+}
