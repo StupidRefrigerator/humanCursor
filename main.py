@@ -1,4 +1,4 @@
-"""M2–M6: HSV blob tracking, calibration, smoothing, and axis mapping preview."""
+"""M2–M7: HSV blob tracking, calibration, smoothing, axis mapping, squat preview."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import math
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,8 +19,8 @@ import config
 @dataclass
 class Blob:
     centroid: tuple[int, int]
-    bbox: tuple[int, int, int, int]  # x, y, w, h
-    area: float
+    bbox: tuple[int, int, int, int]  # x, y, w, h (visual overlay only)
+    area: float  # cv2.contourArea — actual detected pixels, not bbox w×h
 
 
 @dataclass
@@ -105,6 +106,240 @@ class BlobSmoother:
         self._cx.reset()
         self._cy.reset()
         self._area.reset()
+
+
+@dataclass
+class MotionSample:
+    y: float
+    area: float
+    timestamp: float
+
+
+class SquatDetector:
+    """Rolling vertical-velocity tracker with area-stability squat gate (M7 preview)."""
+
+    def __init__(self) -> None:
+        self._history: deque[MotionSample] = deque(maxlen=config.SQUAT_HISTORY_FRAMES)
+        self._velocity_history: deque[float] = deque(maxlen=60)
+        self._last_squat_time = 0.0
+        self.vertical_velocity = 0.0
+        self.area_change_ratio = 0.0
+
+    def update(self, smoothed: SmoothedBlob, now: float) -> None:
+        self._history.append(
+            MotionSample(
+                y=smoothed.centroid[1],
+                area=smoothed.area,
+                timestamp=now,
+            )
+        )
+        if len(self._history) < 2:
+            self.vertical_velocity = 0.0
+            self.area_change_ratio = 0.0
+            self._velocity_history.append(0.0)
+            return
+
+        oldest = self._history[0]
+        newest = self._history[-1]
+        dt = newest.timestamp - oldest.timestamp
+        if dt > 0:
+            self.vertical_velocity = (newest.y - oldest.y) / dt
+        else:
+            self.vertical_velocity = 0.0
+
+        ref_area = max(oldest.area, 1.0)
+        self.area_change_ratio = abs(newest.area - oldest.area) / ref_area
+        self._velocity_history.append(self.vertical_velocity)
+
+    @property
+    def velocity_history(self) -> deque[float]:
+        return self._velocity_history
+
+    def reset(self) -> None:
+        self._history.clear()
+        self.vertical_velocity = 0.0
+        self.area_change_ratio = 0.0
+
+    def check_squat(self, now: float) -> bool:
+        if len(self._history) < 2:
+            return False
+
+        cooldown_sec = config.SQUAT_COOLDOWN_MS / 1000.0
+        if now - self._last_squat_time < cooldown_sec:
+            return False
+
+        velocity_ok = self.vertical_velocity >= config.SQUAT_VELOCITY_THRESHOLD
+        area_stable = self.area_change_ratio <= config.SQUAT_AREA_TOLERANCE
+        if velocity_ok and area_stable:
+            self._last_squat_time = now
+            return True
+        return False
+
+
+class YAxisFreezer:
+    """Velocity-gated Y hold: freeze depth mapping while centroid is in vertical motion."""
+
+    def __init__(self) -> None:
+        self._is_frozen = False
+        self._frozen_y: float | None = None
+        self._last_stable_y: float | None = None
+        self._calm_frames = 0
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._is_frozen
+
+    @property
+    def frozen_y(self) -> float | None:
+        return self._frozen_y
+
+    def reset(self) -> None:
+        self._is_frozen = False
+        self._frozen_y = None
+        self._last_stable_y = None
+        self._calm_frames = 0
+
+    def apply(self, y_norm: float | None, vertical_velocity: float) -> float | None:
+        if y_norm is None:
+            return self._frozen_y if self._is_frozen else None
+
+        motion_threshold = config.SQUAT_MOTION_VELOCITY_THRESHOLD
+        in_motion = vertical_velocity >= motion_threshold
+
+        if self._is_frozen:
+            if not in_motion:
+                self._calm_frames += 1
+            else:
+                self._calm_frames = 0
+
+            if self._calm_frames >= config.SQUAT_Y_UNFREEZE_FRAMES:
+                self._is_frozen = False
+                self._frozen_y = None
+                self._calm_frames = 0
+                self._last_stable_y = y_norm
+                return y_norm
+
+            return self._frozen_y
+
+        if not in_motion:
+            self._last_stable_y = y_norm
+
+        if in_motion:
+            self._is_frozen = True
+            self._frozen_y = (
+                self._last_stable_y if self._last_stable_y is not None else y_norm
+            )
+            self._calm_frames = 0
+            return self._frozen_y
+
+        return y_norm
+
+
+def draw_squat_flash(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    text = "SQUAT / CLICK"
+    scale = 1.4
+    thickness = 3
+    text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, scale, thickness)
+    x = max(10, (width - text_size[0]) // 2)
+    y = 55
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (width, 80), (0, 0, 0), thickness=-1)
+    cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+    cv2.putText(
+        frame,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_DUPLEX,
+        scale,
+        (0, 0, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_velocity_hud(
+    frame: np.ndarray,
+    vertical_velocity: float,
+    area_change_ratio: float,
+    velocity_history: deque[float],
+) -> None:
+    height, width = frame.shape[:2]
+    graph_w, graph_h = 140, 48
+    margin = 10
+    origin_x = width - graph_w - margin
+    origin_y = height - graph_h - 58
+
+    cv2.rectangle(
+        frame,
+        (origin_x - 6, origin_y - 66),
+        (width - margin, origin_y + graph_h + 6),
+        (20, 20, 20),
+        thickness=-1,
+    )
+
+    vel_color = (0, 0, 255) if vertical_velocity >= config.SQUAT_VELOCITY_THRESHOLD else (0, 255, 0)
+    cv2.putText(
+        frame,
+        f"vy: {vertical_velocity:6.0f} px/s  (squat {config.SQUAT_VELOCITY_THRESHOLD})",
+        (origin_x, origin_y - 34),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        vel_color,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"motion gate: {config.SQUAT_MOTION_VELOCITY_THRESHOLD} px/s",
+        (origin_x, origin_y - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
+    area_pct = area_change_ratio * 100.0
+    area_color = (
+        (0, 255, 0)
+        if area_change_ratio <= config.SQUAT_AREA_TOLERANCE
+        else (0, 165, 255)
+    )
+    cv2.putText(
+        frame,
+        f"area d: {area_pct:4.1f}%  (max {config.SQUAT_AREA_TOLERANCE * 100:.0f}%)",
+        (origin_x, origin_y - 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        area_color,
+        1,
+        cv2.LINE_AA,
+    )
+
+    if len(velocity_history) >= 2:
+        values = list(velocity_history)
+        max_val = max(config.SQUAT_VELOCITY_THRESHOLD * 1.25, max(values), 1.0)
+        points: list[tuple[int, int]] = []
+        for i, value in enumerate(values):
+            px = origin_x + int(i * (graph_w - 1) / max(len(values) - 1, 1))
+            py = origin_y + graph_h - int((max(0.0, value) / max_val) * (graph_h - 1))
+            points.append((px, py))
+
+        for i in range(1, len(points)):
+            cv2.line(frame, points[i - 1], points[i], (0, 200, 255), 1, cv2.LINE_AA)
+
+        thresh_y = origin_y + graph_h - int(
+            (config.SQUAT_VELOCITY_THRESHOLD / max_val) * (graph_h - 1)
+        )
+        cv2.line(
+            frame,
+            (origin_x, thresh_y),
+            (origin_x + graph_w, thresh_y),
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def open_camera(preferred_index: int) -> cv2.VideoCapture | None:
@@ -290,13 +525,18 @@ def build_mask(hsv: np.ndarray, window: str) -> np.ndarray:
     return cv2.inRange(hsv, np.array(lower), np.array(upper))
 
 
+def compute_contour_area(contour: np.ndarray) -> float:
+    """Pixel area of the detected headband contour (not bounding-box w×h)."""
+    return float(cv2.contourArea(contour))
+
+
 def find_largest_blob(mask: np.ndarray) -> Blob | None:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
     largest = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(largest)
+    area = compute_contour_area(largest)
     if area < config.MIN_CONTOUR_AREA:
         return None
 
@@ -489,10 +729,12 @@ def draw_mapping_overlay(
     y_norm: float | None,
     area_near: float | None,
     area_far: float | None,
+    y_frozen: bool = False,
     y_offset: int = 104,
 ) -> None:
     if x_norm is not None and y_norm is not None:
-        mapping_line = f"mapped   x={x_norm:.3f}  y={y_norm:.3f}"
+        freeze_tag = "  [Y FROZEN]" if y_frozen else ""
+        mapping_line = f"mapped   x={x_norm:.3f}  y={y_norm:.3f}{freeze_tag}"
         color = (203, 20, 255)
     else:
         mapping_line = "mapped   press 'n' (near) and 'f' (far) to calibrate depth"
@@ -513,7 +755,7 @@ def draw_mapping_overlay(
     far_text = f"{area_far:.0f}" if area_far is not None else "—"
     cv2.putText(
         frame,
-        f"baselines  near(max)={near_text}  far(min)={far_text}",
+        f"baselines  near(max)={near_text}  far(min)={far_text}  (contour px)",
         (10, y_offset + 22),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -543,6 +785,7 @@ def draw_blob_overlay(
     y_norm: float | None = None,
     area_near: float | None = None,
     area_far: float | None = None,
+    y_frozen: bool = False,
 ) -> None:
     if blob is None:
         cv2.putText(
@@ -567,12 +810,12 @@ def draw_blob_overlay(
 
     raw_cx, raw_cy = blob.centroid
     lines = [
-        f"raw      cx={raw_cx:4d}  cy={raw_cy:4d}  area={blob.area:6.0f}",
+        f"raw      cx={raw_cx:4d}  cy={raw_cy:4d}  contour={blob.area:6.0f}",
     ]
     if smoothed is not None:
         sm_cx, sm_cy = smoothed.centroid
         lines.append(
-            f"smooth   cx={sm_cx:6.1f}  cy={sm_cy:6.1f}  area={smoothed.area:6.1f}"
+            f"smooth   cx={sm_cx:6.1f}  cy={sm_cy:6.1f}  contour={smoothed.area:6.1f}"
         )
 
     y_offset = 60
@@ -589,7 +832,9 @@ def draw_blob_overlay(
         )
         y_offset += 22
 
-    draw_mapping_overlay(frame, x_norm, y_norm, area_near, area_far, y_offset=y_offset)
+    draw_mapping_overlay(
+        frame, x_norm, y_norm, area_near, area_far, y_frozen=y_frozen, y_offset=y_offset
+    )
 
     if x_norm is not None and y_norm is not None:
         draw_tracking_dot(frame, x_norm, y_norm)
@@ -610,6 +855,8 @@ def main() -> int:
     area_near = calibration.area_near
     area_far = calibration.area_far
     smoother = BlobSmoother(config.EMA_ALPHA)
+    squat_detector = SquatDetector()
+    y_axis_freezer = YAxisFreezer()
 
     cv2.namedWindow(config.WINDOW_NAME, cv2.WINDOW_NORMAL)
     setup_trackbars(config.WINDOW_NAME, calibration.hsv)
@@ -625,6 +872,7 @@ def main() -> int:
     displayed_fps = 0.0
     last_smoothed_area: float | None = None
     pending_calibration: PendingAreaCalibration | None = None
+    squat_flash_until = 0.0
 
     try:
         while True:
@@ -633,6 +881,9 @@ def main() -> int:
                 print("Failed to read frame from webcam.", file=sys.stderr)
                 break
 
+            frame = cv2.flip(frame, 1)
+            now = time.perf_counter()
+
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             mask = build_mask(hsv, config.WINDOW_NAME)
             blob = find_largest_blob(mask)
@@ -640,13 +891,25 @@ def main() -> int:
             smoothed: SmoothedBlob | None = None
             x_norm: float | None = None
             y_norm: float | None = None
+            y_norm_mapped: float | None = None
             if blob is not None:
                 smoothed = smoother.update(blob)
                 frame_height, frame_width = frame.shape[:2]
                 x_norm = map_x_norm(smoothed.centroid[0], frame_width)
-                y_norm = map_y_norm(smoothed.area, area_near, area_far)
+                y_norm_mapped = map_y_norm(smoothed.area, area_near, area_far)
+                squat_detector.update(smoothed, now)
+                y_norm = y_axis_freezer.apply(y_norm_mapped, squat_detector.vertical_velocity)
+                if squat_detector.check_squat(now):
+                    squat_flash_until = now + (config.SQUAT_FLASH_MS / 1000.0)
+                    print(
+                        "SQUAT / CLICK — "
+                        f"vy={squat_detector.vertical_velocity:.0f} px/s, "
+                        f"area d={squat_detector.area_change_ratio * 100:.1f}%"
+                    )
             else:
                 smoother.reset()
+                squat_detector.reset()
+                y_axis_freezer.reset()
 
             annotated = frame.copy()
             draw_blob_overlay(
@@ -657,10 +920,10 @@ def main() -> int:
                 y_norm=y_norm,
                 area_near=area_near,
                 area_far=area_far,
+                y_frozen=y_axis_freezer.is_frozen,
             )
 
             frame_count += 1
-            now = time.perf_counter()
             elapsed = now - fps_interval_start
             if elapsed >= 1.0:
                 displayed_fps = frame_count / elapsed
@@ -694,6 +957,17 @@ def main() -> int:
                 cv2.LINE_AA,
             )
             draw_key_legend(annotated)
+
+            if smoothed is not None:
+                draw_velocity_hud(
+                    annotated,
+                    squat_detector.vertical_velocity,
+                    squat_detector.area_change_ratio,
+                    squat_detector.velocity_history,
+                )
+
+            if now < squat_flash_until:
+                draw_squat_flash(annotated)
 
             if pending_calibration is not None:
                 remaining = pending_calibration.deadline - time.perf_counter()

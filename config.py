@@ -16,7 +16,7 @@ MIN_CONTOUR_AREA = 500
 MORPH_KERNEL = 3
 
 # --- Signal smoothing (M5) ---
-EMA_ALPHA = 0.6
+EMA_ALPHA = 0.1
 
 # --- Axis mapping (M6) ---
 TRACKING_DOT_COLOR = (203, 20, 255)  # bright neon pink (BGR)
@@ -27,9 +27,13 @@ FORWARD_IS_UP = True  # larger blob (closer) moves cursor up
 CALIBRATION_COUNTDOWN_SEC = 5
 
 # --- Squat detection (M7) ---
-SQUAT_VELOCITY_THRESHOLD = 600  # pixels per second
-SQUAT_COOLDOWN_MS = 400
-SQUAT_Y_FREEZE_MS = 250
+SQUAT_VELOCITY_THRESHOLD = 300  # pixels per second (downward = positive)
+SQUAT_COOLDOWN_MS = 500
+SQUAT_AREA_TOLERANCE = 0.5  # max fractional area change during squat
+SQUAT_HISTORY_FRAMES = 10
+SQUAT_FLASH_MS = 600
+SQUAT_MOTION_VELOCITY_THRESHOLD = 40  # low vy gate: Y freeze while above, resume after calm
+SQUAT_Y_UNFREEZE_FRAMES = 1 # consecutive sub-threshold frames before Y tracking resumes
 
 # --- Cursor control (M8) ---
 CURSOR_LIBRARY = "pynput"  # "pynput" or "pyautogui"
